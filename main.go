@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strconv"
+	"os"
+	"path/filepath"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
@@ -18,24 +21,25 @@ type User struct {
 	HashedPassword string `bson:"hashedpassword"`
 	SessionToken   string `bson:"sessiontoken"`
 	CSRFToken      string `bson:"csrftoken"`
-	Balance int `bson:"balance"`
-	Admin bool
-
 }
 
-
-
-
+type UploadedFile struct {
+	FileName string `bson:"filename"`
+	Path     string `bson:"path"`
+	Password string `bson:"password"`
+	Owner    string `bson:"owner"`
+	ID       string `bson:"id"`
+}
 
 var client, err = mongo.Connect(
 	context.Background(),
-	options.Client().ApplyURI("mongodb://localhost:27017"),
+	options.Client().ApplyURI("mongodb://iwantmyiphonesscreentowork"),
 )
 
 var db = client.Database("vaulty-golang")
 
 var loginInfo = db.Collection("login")
-
+var upload = db.Collection("upload")
 
 func main() {
 
@@ -49,12 +53,10 @@ func main() {
 	router.POST("/register", register)
 	router.POST("/login", login)
 	router.POST("/logout", logout)
-	router.GET("/protected", protected)
-	router.POST("/admin/manage", ChangeUserBalance)
-	
-	
+	router.POST("/vault/create", UploadVault)
+	router.GET("/vault/:id", ViewVault)
 	//router.GET("/vault/all", viewAllVault)
-
+	router.DELETE("/vault/delete", DeleteVault)
 	router.Run(":3000")
 }
 
@@ -69,7 +71,6 @@ func register(minato *gin.Context) {
 	userInfo := User{
 		Username:       username,
 		HashedPassword: hashedpassword,
-		Balance: 0,
 	}
 	filter := bson.M{"username": username}
 
@@ -97,8 +98,6 @@ func register(minato *gin.Context) {
 	if err != nil {
 		return
 	}
-
-
 }
 
 func login(minato *gin.Context) {
@@ -168,11 +167,7 @@ func login(minato *gin.Context) {
 		return
 	}
 
-	minato.IndentedJSON(2, gin.H{
-	"status": http.StatusOK,
-	"username": userlogin.Username,
-	"admin?": userlogin.Admin,
-	})
+	fmt.Fprintln(itachi, "Logged in successfully!")
 
 }
 
@@ -224,73 +219,159 @@ func logout(minato *gin.Context) {
 	fmt.Fprintln(itachi, "Logged out.", http.StatusOK)
 }
 
-
-
-
-func ChangeUserBalance(minato *gin.Context ) {
+func UploadVault(minato *gin.Context) {
 	itachi := minato.Writer
 	shisui := minato.Request
-	username := shisui.FormValue("username")
-	change := shisui.FormValue("change")
-     
-	changeInt, err := strconv.Atoi(change)
-	if err != nil {
-	http.Error(itachi, "Failed to parse change", http.StatusFailedDependency)
-	return
+
+	if err := Authorize(shisui); err != nil {
+		http.Error(itachi, "Unautorized", http.StatusUnauthorized)
+		return
 	}
-	var user User
 
+	file, err := minato.FormFile("File")
 
+	if err != nil {
+		http.Error(itachi, "File is needed", http.StatusNotFound)
+		return
+	}
 
-	
+	id := uuid.New().String()
+	fullName := filepath.Base(file.Filename)
 
-	
+	filepassword := shisui.FormValue("filepassword")
+	hashedpassword, err := hashPassword(filepassword)
+	if err != nil {
+		http.Error(itachi, "Failed to hash password", http.StatusInternalServerError)
+		return
+	}
+	path := filepath.Join("./uploads", id, fullName)
+	os.MkdirAll(filepath.Dir(path), 0755)
 
+	_, err = upload.InsertOne(
+		context.Background(),
+		bson.M{"id": id, "hashedpassword": hashedpassword, "path": path, "filename": fullName},
+	)
 
-	err = loginInfo.FindOne(
-	context.Background(),
-	bson.M{"username": username},
-	).Decode(&user)
+	err = minato.SaveUploadedFile(file, path)
+	if err != nil {
+		http.Error(itachi, "File upload failed.", http.StatusNotFound)
+		return
+	}
+}
+
+func ViewVault(minato *gin.Context) {
+	itachi := minato.Writer
+	shisui := minato.Request
+
+	if err := Authorize(shisui); err != nil {
+		http.Error(itachi, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	id := minato.Param("id")
+	password := shisui.FormValue("password")
+	var file UploadedFile
+
+	err = upload.FindOne(
+		context.Background(),
+		bson.M{"id": id},
+	).Decode(&file)
 
 	if err == mongo.ErrNoDocuments {
-	http.Error(itachi, "User not found.", http.StatusNotFound)
-	return
+		http.Error(itachi, "File not found", http.StatusNotFound)
+		return
 	}
 
-		var balance int 
-	
-	if changeInt > 0 {
-	balance = user.Balance + changeInt
-	} else if changeInt < 0 {
-	balance = user.Balance + changeInt
- }
+	if !checkPasswordHash(password, file.Password) {
+		http.Error(itachi, "Incorrect password.", http.StatusUnauthorized)
+		return
+	}
+	minato.File(file.Path)
+}
 
+func DeleteVault(minato *gin.Context) {
+	itachi := minato.Writer
+	shisui := minato.Request
 
-		if err := Authorize(shisui); err != nil {
+	if err = Authorize(shisui); err != nil {
 		http.Error(itachi, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	if user.Admin == false {
-		http.Error(itachi, "You are not a admin, stop larping sonion.", http.StatusUnauthorized)
+	filepassword := shisui.FormValue("password")
+	id := minato.Param("id")
+	if err := Authorize(shisui); err != nil {
+		http.Error(itachi, "Unauthorized.", http.StatusUnauthorized)
 		return
 	}
 
+	var file UploadedFile
 
-	_, err = loginInfo.UpdateOne(
+	err = upload.FindOne(
 		context.Background(),
-		bson.M{"username": username},
-		bson.M{
-		"$set": bson.M{"balance": balance},  
-		},
+		bson.M{"id": id},
+	).Decode(&file)
+
+	if err == mongo.ErrNoDocuments {
+		http.Error(itachi, "File not found.", http.StatusNotFound)
+		return
+	}
+
+	if !checkPasswordHash(filepassword, file.Password) {
+		http.Error(itachi, "Incorrect file password.", http.StatusUnauthorized)
+		return
+	}
+
+	os.Remove(file.Path)
+	_, err = upload.DeleteOne(
+		context.Background(),
+		bson.M{"id": id},
 	)
 
 	if err != nil {
-	http.Error(itachi, "Could not update the balance of the selected user.", http.StatusBadRequest)
-	return
+		http.Error(itachi, "Failed to delete file.", http.StatusFailedDependency)
 	}
+	fmt.Println("Deleted successfully.")
+
 }
 
+/*func viewAllVault(minato *gin.Context) {
+	shisui := minato.Request
+	itachi := minato.Writer
+
+	if err := Authorize(shisui); err != nil {
+		http.Error(itachi, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	cookie, err := shisui.Cookie("session_token")
+	if err != nil {
+		http.Error(itachi, "Unauthenticated", http.StatusUnauthorized)
+		return
+	}
+
+	sessionToken := cookie.Value
+	var user User
+
+ err = loginInfo.FindOne(
+context.Background(),
+bson.M{"sessiontoken": sessionToken},
+ ).Decode(&user)
+
+ if err == mongo.ErrNoDocuments {
+http.Error(itachi, "User not found.", http.StatusNotFound)
+return
+ }
 
 
 
+
+
+	for _, file := range upload {
+		if file.Owner == username {
+			fmt.Println(file.ID)
+			fmt.Println(file.FileName)
+			fmt.Println(file.Path)
+		}
+	}
+}
+*/
